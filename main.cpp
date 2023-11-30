@@ -17,6 +17,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <tuple>
 
 static std::string_view s_output_file;
 
@@ -249,8 +250,82 @@ inline void do_make(const char * prog, int argc, char * argv[]) {
     }
 }
 
-static void do_compile(int argc, char * argv[]) {
+inline std::tuple<const char*, const char *> parse_compile_command(int argc, char * argv[]) {
 
+    std::tuple<const char*, const char *> ret;
+    const char *input = nullptr, *output = nullptr;
+    int i;
+
+    // 找到 gcc 或 g++ 的输出文件
+    for (i = 0; i < argc; ++i) {
+        auto const arg = argv[i];
+        if (arg == std::string_view{"-o"} && i + 1 < argc) {
+            break;
+        }
+    }
+
+    if (i >= argc) {
+        return ret;
+    }
+
+    output = argv[i + 1];
+
+    // 找到 gcc 或 g++ 的输入文件
+    i = 0;
+    for (; i < argc; ++i) {
+        if (strstr(argv[i], ".c")) {
+            break;
+        } else if (strstr(argv[i], ".cpp")) {
+            break;
+        } else if (strstr(argv[i], ".cc")) {
+            break;
+        } else if (strstr(argv[i], ".cxx")) {
+            break;
+        } else {
+            return ret;
+        }
+    }
+
+    if (i >= argc) {
+        return ret;
+    }
+
+    input = argv[i];
+    ret = std::make_tuple(input, output);
+    return ret;
+}
+
+inline void do_compile(int argc, char * argv[]) {
+    // 解析编译命令
+    auto const [input, output] = parse_compile_command(argc, argv);
+    if (input && output) {
+        // 获取 unix domain socket 的路径
+        auto const socket_path = getenv("SBEARE_SOCKET_PATH");
+        if (!socket_path) {
+            std::cerr << "SBEARE_SOCKET_PATH not set" << std::endl;
+            return;
+        }
+
+        // 打开 unix domain socket
+        auto const sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (sock < 0) {
+            perror("socket");
+            return;
+        }
+
+        // 构造 unix domain socket 地址
+        struct sockaddr_un addr;
+        addr.sun_family = AF_UNIX;
+        strcpy(addr.sun_path, socket_path);
+
+        // TODO: 发送编译命令
+
+        // 关闭 unix domain socket
+        close(sock);
+    }
+
+    // 执行编译命令
+    execvp(argv[0], argv);
 }
 
 int main(int argc, char * argv[]) {

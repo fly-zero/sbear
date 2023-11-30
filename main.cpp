@@ -17,7 +17,7 @@ inline void print_usage(const char * arg0) {
 }
 
 inline int parse_args(int argc, char * argv[]) {
-    int i = 0;
+    int i = 1;
     while (true) {
         if (argv[i] == std::string_view{"-o"} && i + 1 < argc) {
             s_output_file = argv[i + 1];
@@ -91,7 +91,14 @@ inline const char * get_make_cc_cxx_args(const char * arg0) {
     return buff;
 }
 
-static void do_make(char * cmdline[]) {
+static void do_make(const char * prog, int argc, char * argv[]) {
+    auto const cmdline = static_cast<char **>(alloca((argc + 2) * sizeof(char *)));
+    for (int j = 0; j < argc; ++j) {
+        cmdline[j] = argv[j];
+    }
+    cmdline[argc] = strdupa(get_make_cc_cxx_args(prog));
+    cmdline[argc + 1] = nullptr;
+
     // 构造 unix domain socket 路径
     char socket_path[PATH_MAX];
     auto const err = snprintf(socket_path, sizeof socket_path, "/tmp/sbeare-%u.sock", getpid());
@@ -113,26 +120,18 @@ static void do_make(char * cmdline[]) {
     }
 }
 
-static void do_compile(char * cmdline[]) {
+static void do_compile(int argc, char * argv[]) {
 
 }
 
 int main(int argc, char * argv[]) {
     auto const i = parse_args(argc, argv);
     auto const command = std::string_view{argv[i]};
-    auto const cmdline = static_cast<char **>(alloca((argc - i + 1) * sizeof(char *)));
-
-    for (int j = i; j < argc; ++j) {
-        cmdline[j - i] = argv[j];
-    }
-
-    cmdline[argc - i] = strdupa(get_make_cc_cxx_args(argv[0]));
-    cmdline[argc - i + 1] = nullptr;
 
     if (command == "make") {
-        do_make(cmdline);
+        do_make(argv[0], argc - i, argv + i);
     } else if (is_compile_tool(command)) {
-        do_compile(cmdline);
+        do_compile(argc - i, argv + i);
     } else {
         std::cerr << "Unknown command: " << command << std::endl;
         print_usage(argv[0]);

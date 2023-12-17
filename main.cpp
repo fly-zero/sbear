@@ -20,32 +20,68 @@
 #include <tuple>
 
 static std::string_view s_output_file;
+static char s_buffer[PATH_MAX];
+
+static void * varint_encode(void * dst, uint64_t value) {
+    auto p = static_cast<uint8_t *>(dst);
+    while (value >= 0x80) {
+        *p++ = static_cast<uint8_t>(value) | 0x80;
+        value >>= 7;
+    }
+
+    *p++ = static_cast<uint8_t>(value);
+    return p;
+}
+
+static void * varint_decode(void * src, uint64_t & value) {
+    auto p = static_cast<uint8_t *>(src);
+    value = 0;
+    for (int shift = 0; shift < 64; shift += 7) {
+        uint64_t const byte = *p++;
+        value |= (byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) {
+            break;
+        }
+    }
+
+    return p;
+}
 
 inline void print_usage(const char * arg0) {
     std::cerr << "Usage: " << arg0 << " [-o <output-file>] -- <command> [<args>...]\n";
 }
 
 inline int parse_args(int argc, char * argv[]) {
-    int i = 1;
-    while (true) {
-        if (argv[i] == std::string_view{"-o"} && i + 1 < argc) {
-            s_output_file = argv[i + 1];
-            i += 2;
-        } else if (argv[i] == std::string_view{"--"}) {
-            ++i;
-            break;
-        } else {
-            std::cerr << "Unknown argument: " << argv[i] << std::endl;
+    // 如果 argv[0] 是以 "-gcc" 或 "-g++" 结尾的，那么就认为是 gcc 或 g++ 的别名
+    auto const arg0 = std::string_view{argv[0]};
+    if (arg0.ends_with("-gcc")) {
+        argv[0] += arg0.size() - 3;
+        return 0;
+    } else if (arg0.ends_with("-g++")) {
+        argv[0] += arg0.size() - 3;
+        return 0;
+    } else {
+        int i = 1;
+        while (true) {
+            if (argv[i] == std::string_view{"-o"} && i + 1 < argc) {
+                s_output_file = argv[i + 1];
+                i += 2;
+            } else if (argv[i] == std::string_view{"--"}) {
+                ++i;
+                break;
+            } else {
+                std::cerr << "Unknown argument: " << argv[i] << std::endl;
+                goto error;
+            }
+        }
+
+        if (i >= argc) {
+            std::cerr << "No command given" << std::endl;
             goto error;
         }
-    }
 
-    if (i >= argc) {
-        std::cerr << "No command given" << std::endl;
-        goto error;
+        return i;
     }
-
-    return i;
 
 error:
     print_usage(argv[0]);
@@ -65,10 +101,8 @@ inline bool is_compile_tool(std::string_view command) {
     return std::any_of(first, last, pred);
 }
 
-
-inline const char * get_cmdline(int argc, char * argv[], int i, const char * extra_args = nullptr) {
-    static char buff[PATH_MAX];
-    auto p = buff;
+inline char * get_cmdline(int argc, char * argv[], int i, const char * extra_args = nullptr) {
+    auto p = s_buffer;
     for (; i < argc; ++i) {
         auto const arg = argv[i];
         auto const len = strlen(arg);
@@ -84,20 +118,18 @@ inline const char * get_cmdline(int argc, char * argv[], int i, const char * ext
     }
 
     *p = '\0';
+    return s_buffer;
 }
 
 inline const char * get_abs_path(const char * filename) {
-    static char buff[PATH_MAX];
-    realpath(filename, buff);
-    return buff;
+    realpath(filename, s_buffer);
+    return s_buffer;
 }
 
-inline const char * get_make_cc_cxx_args(const char * arg0) {
-    static char buff[PATH_MAX];
-    auto const abs_arg0 = get_abs_path(arg0);
-    auto const err = snprintf(buff, sizeof buff, "CC=\"%s gcc\" CXX=\"%s g++\"", abs_arg0, abs_arg0);
-    assert(0 < err && static_cast<size_t>(err) < sizeof buff);
-    return buff;
+inline const char * get_make_compiler_env_str(const char * name, const char * prefix, const char * exe) {
+    auto const err = snprintf(s_buffer, sizeof s_buffer, "%s=%s-%s", name, prefix, exe);
+    assert(0 < err && static_cast<size_t>(err) < sizeof s_buffer);
+    return s_buffer;
 }
 
 inline int listen_unix_socket(const char * path) {
@@ -194,8 +226,11 @@ inline void do_make(const char * prog, int argc, char * argv[]) {
     for (int j = 0; j < argc; ++j) {
         cmdline[j] = argv[j];
     }
-    cmdline[argc] = strdupa(get_make_cc_cxx_args(prog));
-    cmdline[argc + 1] = nullptr;
+
+    auto const abs_prog_path = strdupa(get_abs_path(prog));
+    cmdline[argc + 0] = strdupa(get_make_compiler_env_str("CC", abs_prog_path, "gcc"));
+    cmdline[argc + 1] = strdupa(get_make_compiler_env_str("CXX", abs_prog_path, "g++"));
+    cmdline[argc + 2] = nullptr;
 
     // 构造 unix domain socket 路径
     char socket_path[PATH_MAX];
@@ -282,7 +317,7 @@ inline std::tuple<const char*, const char *> parse_compile_command(int argc, cha
         } else if (strstr(argv[i], ".cxx")) {
             break;
         } else {
-            return ret;
+            continue;
         }
     }
 
@@ -295,17 +330,56 @@ inline std::tuple<const char*, const char *> parse_compile_command(int argc, cha
     return ret;
 }
 
+void send_message(int sock, std::string_view pwd, std::string_view cmdline, std::string_view input) {
+    // 分配足够的空间
+    auto const len = 32 + pwd.size() + cmdline.size() + input.size();
+    auto const buff = static_cast<char *>(alloca(len));
+    auto p = buff;
+
+    // 写入当前工作目录的路径
+    p = static_cast<char *>(varint_encode(p, pwd.size()));
+    memcpy(p, pwd.data(), pwd.size());
+    p += pwd.size();
+
+    // 写入命令行
+    p = static_cast<char *>(varint_encode(p, cmdline.size()));
+    memcpy(p, cmdline.data(), cmdline.size());
+    p += cmdline.size();
+
+    // 写入输入文件的路径
+    p = static_cast<char *>(varint_encode(p, input.size()));
+    memcpy(p, input.data(), input.size());
+    p += input.size();
+
+    // 获取 unix domain socket 的路径
+    auto const socket_path = getenv("SBEARE_SOCKET_PATH");
+    if (!socket_path) {
+        std::cerr << "SBEARE_SOCKET_PATH not set" << std::endl;
+        return;
+    }
+
+    // 构造 unix domain socket 地址
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, socket_path);
+
+    // 发送消息
+    auto const buf_size = p - buff;
+    auto const n = sendto(sock,
+                          buff,
+                          buf_size,
+                          0,
+                          reinterpret_cast<struct sockaddr *>(&addr),
+                          sizeof addr);
+    if (n != buf_size) {
+        perror("send");
+    }
+}
+
 inline void do_compile(int argc, char * argv[]) {
     // 解析编译命令
-    auto const [input, output] = parse_compile_command(argc, argv);
+    auto [input, output] = parse_compile_command(argc, argv);
     if (input && output) {
-        // 获取 unix domain socket 的路径
-        auto const socket_path = getenv("SBEARE_SOCKET_PATH");
-        if (!socket_path) {
-            std::cerr << "SBEARE_SOCKET_PATH not set" << std::endl;
-            return;
-        }
-
         // 打开 unix domain socket
         auto const sock = socket(AF_UNIX, SOCK_DGRAM, 0);
         if (sock < 0) {
@@ -313,12 +387,11 @@ inline void do_compile(int argc, char * argv[]) {
             return;
         }
 
-        // 构造 unix domain socket 地址
-        struct sockaddr_un addr;
-        addr.sun_family = AF_UNIX;
-        strcpy(addr.sun_path, socket_path);
-
-        // TODO: 发送编译命令
+        // 发送编译命令
+        auto const pwd = strdupa(get_current_dir_name());
+        auto const cmdline = strdupa(get_cmdline(argc, argv, 0));
+        input = strdupa(get_abs_path(input));
+        send_message(sock, pwd, cmdline, input);
 
         // 关闭 unix domain socket
         close(sock);

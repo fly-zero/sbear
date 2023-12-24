@@ -1,3 +1,5 @@
+#include <bits/types/sigset_t.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
@@ -15,12 +17,16 @@
 #include <cstring>
 
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <tuple>
 
 static std::string_view s_output_file;
 static char s_buffer[PATH_MAX];
+static bool s_running = true;
+static bool s_first_message = true;
+static std::ofstream s_ofs;
 
 static void * varint_encode(void * dst, uint64_t value) {
     auto p = static_cast<uint8_t *>(dst);
@@ -188,6 +194,15 @@ inline int create_signalfd(int signo) {
         return -1;
     }
 
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, signo);
+    if (sigprocmask(SIG_BLOCK, &mask, nullptr) != 0) {
+        perror("sigprocmask");
+        close(sigfd);
+        return -1;
+    }
+
     return sigfd;
 }
 
@@ -196,8 +211,36 @@ inline void read_unix_socket(int sock) {
         char buff[8192];
         auto const n = recvfrom(sock, buff, sizeof buff, 0, nullptr, nullptr);
         if (n > 0) {
-            std::cout << "recv: " << buff << std::endl;
-            // TODO: 解析命令
+            auto p = buff;
+            uint64_t len;
+            p = static_cast<char *>(varint_decode(p, len));
+            auto const pwd = std::string_view{p, len};
+            p += len;
+
+            p = static_cast<char *>(varint_decode(p, len));
+            auto const cmdline = std::string_view{p, len};
+            p += len;
+
+            p = static_cast<char *>(varint_decode(p, len));
+            auto const input = std::string_view{p, len};
+            p += len;
+
+            if (p > buff + n) {
+                std::cerr << "Invalid message" << std::endl;
+                break;
+            }
+
+            if (s_first_message) {
+                s_first_message = false;
+            } else {
+                s_ofs << "," << std::endl;
+            }
+
+            s_ofs << "{" << std::endl;
+            s_ofs << R"(  "directory": ")" << pwd << R"(",)" << std::endl;
+            s_ofs << R"(  "command": ")" << cmdline << R"(",)" << std::endl;
+            s_ofs << R"(  "file": ")" << input << R"(")" << std::endl;
+            s_ofs << "}";
         } else if (n == 0) {
             break;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -213,9 +256,11 @@ inline void read_signal_fd(int sigfd) {
     struct signalfd_siginfo siginfo;
     auto const n = read(sigfd, &siginfo, sizeof siginfo);
     if (n == sizeof siginfo) {
-        std::cout << "recv signal: " << siginfo.ssi_signo << std::endl;
+        s_running = false;
     } else if (n == 0) {
-        std::cout << "signal fd closed" << std::endl;
+        std::cerr << "signalfd read EOF" << std::endl;
+        abort();
+    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
     } else {
         perror("read");
     }
@@ -255,33 +300,47 @@ inline void do_make(const char * prog, int argc, char * argv[]) {
         return;
     }
 
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(sock, &readfds);
-    FD_SET(sigfd, &readfds);
-    auto const maxfdp1 = std::max(sock, sigfd) + 1;
+    // 打开输出文件
+    s_ofs.open(s_output_file.data());
+    if (!s_ofs) {
+        perror("open");
+        return;
+    }
 
     auto const pid = fork();
     if (pid == 0) {
         execvp("make", cmdline);
-    } else while (true) {
-        fd_set tmp = readfds;
-        auto const n = select(maxfdp1, &tmp, nullptr, nullptr, nullptr);
-        if (n > 0) {
-            if (FD_ISSET(sock, &tmp)) {
-                read_unix_socket(sock);
-            } else if (FD_ISSET(sigfd, &tmp)) {
-                read_signal_fd(sigfd);
-                break;
+    } else {
+        // 初始化监听集合
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(sock, &readfds);
+        FD_SET(sigfd, &readfds);
+        auto const maxfdp1 = std::max(sock, sigfd) + 1;
+
+        s_ofs << "[" << std::endl;
+
+        while (s_running) {
+            fd_set tmp = readfds;
+            auto const n = select(maxfdp1, &tmp, nullptr, nullptr, nullptr);
+            if (n > 0) {
+                if (FD_ISSET(sock, &tmp)) {
+                    read_unix_socket(sock);
+                }
+                
+                if (FD_ISSET(sigfd, &tmp)) {
+                    read_signal_fd(sigfd);
+                    break;
+                }
+            } else if (n == 0) {
+                continue;
             } else {
-                assert(false);
+                perror("select");
+                break;
             }
-        } else if (n == 0) {
-            continue;
-        } else {
-            perror("select");
-            break;
         }
+
+        s_ofs << "\n]" << std::endl;
     }
 }
 
